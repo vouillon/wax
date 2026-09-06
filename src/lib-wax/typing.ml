@@ -6412,8 +6412,10 @@ and type_cast ctx i =
          per cast in the chain; [Error] is castable to anything ([cast] /
          [signed_cast] return [true] for it), so only the first failure is
          reported and the rest are absorbed. *)
-      if cast_failed || match ty'_natural with Error -> true | _ -> false then
-        Cell.set ty Error;
+      let poisoned =
+        cast_failed || match ty'_natural with Error -> true | _ -> false
+      in
+      if poisoned then Cell.set ty Error;
       (* Lint the cast against its operand's natural type (snapshotted before
          [cast] above concretised it to the target). Skipped for from-Wasm input
          ([simplify]), whose casts are compiler-inserted and whose redundant ones
@@ -6545,7 +6547,13 @@ and type_cast ctx i =
         | _ -> false
       in
       let unnecessary_cast =
-        (ctx.simplify || (ctx.faithful && target_nullable_ref))
+        (* A poisoned cast (it failed, or its operand was already poison) is
+           never redundant, and its [ty] is now [Error] — a type that must not
+           reach [subtype]'s expected side (whose right-hand assertion excludes
+           it). This is only reachable on the from-Wasm paths: a hand-written
+           cast is not simplified, and a failed one exits on the diagnostic. *)
+        (not poisoned)
+        && (ctx.simplify || (ctx.faithful && target_nullable_ref))
         && (not load_bearing_literal) && (not load_bearing_hole)
         && (not operand_pin_pending) && (not load_bearing_null)
         && (not load_bearing_bottom_ref)
