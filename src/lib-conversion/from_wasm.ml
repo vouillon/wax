@@ -419,6 +419,20 @@ end
 
 (*** The conversion context ***)
 
+(* How a value's own printed form re-types it on a re-parse, as far as the
+   dead-code backing scan can classify it from the node (and the tables below):
+   a REFERENCE settled in a hierarchy — [eq] telling whether it is provably an
+   [eq]-subtype, i.e. a valid [ref.eq] operand, which only an [any]-hierarchy
+   reference other than a bare [&any] can be — a NULL (which every hierarchy
+   accepts), a NON-REFERENCE value, or unclassifiable. What the dead-code
+   reference pins ([ref.is_null] / [ref.eq] / the cross-hierarchy converts) ask
+   of a residual their hole would reconnect to (see [backing_class_of]). *)
+type backing_class =
+  | Ref_class of { hier : [ `Any | `Extern | `Func | `Exn | `Cont ]; eq : bool }
+  | Null_class
+  | Value_class
+  | Unknown_class
+
 type ctx = {
   types : Sequence.t;
   struct_fields : (string, Sequence.t * string list) Hashtbl.t;
@@ -494,19 +508,17 @@ type ctx = {
          [Stack.effective_backing]). Memories and tables share one table: their Wax
          names live in different index spaces but are drawn from one namespace, so
          a name identifies at most one of them. *)
-  multi_ref_results :
-    (string, [ `Any | `Extern | `Func | `Exn | `Cont ] list) Hashtbl.t;
-      (* For a function with a MULTI-value signature carrying reference results:
-         the hierarchies of those references, keyed by the Wax name (like
-         [address_types]). The expectation channel is single-valued, so a
-         multi-value call residual cannot record its composition on the node;
-         this is what lets a cross-hierarchy convert ask whether such a backing
-         CONTAINS a value of its source hierarchy — reconnection is
-         type-directed, so the convert's hole takes exactly such a value, and
-         the convert must stay bare over it (a pin materialises as a [ref.cast]
-         over the reconnected value; see [multi_backing_matches]). Filled at
-         each [Call] emission (any call node the backing scan can see was
-         emitted before the consulting convert). *)
+  multi_ref_results : (string, backing_class array) Hashtbl.t;
+      (* For a function with a MULTI-value signature: the classification of
+         each result, in result order (see [backing_class]), keyed by the Wax
+         name (like [address_types]). The expectation channel is single-valued,
+         so a multi-value call residual cannot record its composition on the
+         node; this is what lets a dead reference op ask what such a backing
+         would hand its reconnecting hole. Reconnection is POSITIONAL — a hole
+         takes the topmost pending value — so the consulting op indexes from
+         the entry's top by the claims interposed holes have already eaten (see
+         [backing_class_of]). Filled at each [Call] emission (any call node the
+         backing scan can see was emitted before the consulting op). *)
   labels : LabelStack.t;
   tag_types : Src.typeuse CondTbl.t;
   label_arities : (string option * int) list;
@@ -1168,6 +1180,16 @@ let cast_to (ty : Ast.casttype) (e : _ Ast.instr) : _ Ast.instr =
 let typed_hole (ty : Ast.valtype) =
   cast_to (Valtype ty) (expect ty (Ast.no_loc_instr Ast.Hole))
 
+(* The bottom heap types. A bare hole ascribed one — [(_ as &?none)] and kin —
+   is the CLAIM-FREE pin: the typer's [count_holes] gives that shape no pending
+   value (nothing but a null or a value off the polymorphic bottom inhabits the
+   type), so unlike a top-of-hierarchy pin it can never capture a stranded
+   residual that an [(@if)] branch, in its own configuration, consumes instead.
+   The dead-code pins below use it wherever a wrong-hierarchy residual is what
+   the printed hole would otherwise reconnect to. *)
+let is_bottom_heaptype (t : Ast.heaptype) =
+  match t with None_ | NoExtern | NoFunc | NoExn | NoCont -> true | _ -> false
+
 (* Drop the expectation recorded on [i] and on everything under it. Used where a
    value's width comes from its CONTEXT rather than from its own printed form — a
    block/function result, an initialiser, a branch delivery. The conversion leaves
@@ -1357,8 +1379,8 @@ module Stack = struct
      see is a value from a producer added later without a record — which is why
      fuzz/ref-width.sh enumerates the shape and the round-trip legs
      FAITHDRIFT/WIDTHDRIFT watch the rest.) *)
-  (* Whether a statement carries a HOLE. Such a statement is NOT transparent to the
-     scan below, however zero-valued it is: on a re-parse its hole claims the first
+  (* A statement carrying a HOLE is NOT transparent to the scan below, however
+     zero-valued it is: on a re-parse its hole claims the first
      value above it, so that value cannot also back a later hole. This is where the
      scan's model used to diverge from both Wasm and Wax. In
      [array.get ; atomic.fence ; drop ; ref.is_null] the WASM [drop] pops the
@@ -1376,23 +1398,6 @@ module Stack = struct
      [(_ as &?any)] as if bottom-sprung, and on re-parse the hole DID reconnect to
      the func-hierarchy value: the pin crossed hierarchies and the decompiled Wax
      did not type-check (a wat-mutation-fuzzer finding). *)
-  let rec carries_untyped_hole (i : _ Ast.instr) =
-    match i.Ast.desc with
-    | Ast.Hole -> (
-        match i.Ast.expected with
-        | Ast.Recorded _ -> false
-        | Ast.Unset | Ast.Contextual -> true)
-    | _ -> List.exists carries_untyped_hole (Ast_utils.sub_instrs i)
-
-  (* A conditional-compilation annotation splices its chosen body into the
-     ENCLOSING frame, and the printed form carries both bodies, so what it claims
-     from this stack is not a number: it stays the opaque blocker every
-     hole-bearing statement used to be. Nothing else is opaque. *)
-  let rec has_cond_annotation (i : _ Ast.instr) =
-    match i.Ast.desc with
-    | Ast.If_annotation _ -> true
-    | _ -> List.exists has_cond_annotation (Ast_utils.sub_instrs i)
-
   (* How many values a statement claims from THIS stack on a re-parse: one per
      UNTYPED hole (a hole whose recorded type is numeric claims no reference, as
      above), plus a block's PARAMETERS, which it takes from here whether or not any
@@ -1402,10 +1407,30 @@ module Stack = struct
      [match]'s scrutinee. *)
   let rec hole_claims (i : _ Ast.instr) =
     match i.Ast.desc with
-    | Ast.Hole -> (
-        match i.Ast.expected with
-        | Ast.Recorded _ -> 0
-        | Ast.Unset | Ast.Contextual -> 1)
+    (* EVERY printed hole claims one value: the typer's claiming is positional
+       and type-blind ([count_holes] is syntactic), so a hole whose recorded
+       type is numeric still takes the next pending value — it merely pairs, in
+       a valid module, with the numeric residual the scan's value arms absorb
+       below. (The old model gave a recorded hole zero claims and skipped every
+       numeric residual unconditionally; the two cancelled only while the
+       pairing was type-consistent, which an [(@if)] breaks.) *)
+    | Ast.Hole -> 1
+    (* A bare hole under a BOTTOM reference ascription is the claim-free pin:
+       the typer's [count_holes] gives it no pending value (see
+       [is_bottom_heaptype]), so it claims nothing here either. *)
+    | Ast.Cast ({ Ast.desc = Ast.Hole; _ }, Ast.Valtype (Ast.Ref { typ; _ }))
+      when is_bottom_heaptype typ ->
+        0
+    (* A conditional annotation claims NOTHING from the tree-typing stack this
+       scan models: the typer that builds the tree the lowering reads types each
+       branch as an isolated void block, so a branch's holes take no enclosing
+       value and a branch's leftovers deliver none. (The CONFIGURATION passes —
+       the Wax checker's spliced typing, like the Wasm validator's — instead
+       splice the chosen branch into the enclosing frame, where its claims mirror
+       the source's own pops per configuration; the emission already mirrors that
+       by construction, one hole per branch pop. What the scan must predict is
+       the reconnection in the PRESERVED tree, whose types drive [To_wasm].) *)
+    | Ast.If_annotation _ -> 0
     | Ast.Block { typ; _ }
     | Ast.Loop { typ; _ }
     | Ast.TryTable { typ; _ }
@@ -1417,6 +1442,18 @@ module Stack = struct
     | Ast.Match { scrutinee; _ } -> hole_claims scrutinee
     | _ ->
         List.fold_left (fun n s -> n + hole_claims s) 0 (Ast_utils.sub_instrs i)
+
+  (* Whether a statement carries a conditional annotation: only such a
+     statement can have consumed — per configuration, in the source's spliced
+     validation — a value whose printed form the tree-typing then pairs with a
+     LATER hole. The scan reports it ([`Backing]'s [crossed]) so a caller whose
+     pin cannot prove the capture sound from the node alone (the [call_ref]
+     callee type pin) can fall back to the claim-free bottom pin only where the
+     hazard exists, keeping the annotation-free behaviour untouched. *)
+  let rec has_cond_annotation (i : _ Ast.instr) =
+    match i.Ast.desc with
+    | Ast.If_annotation _ -> true
+    | _ -> List.exists has_cond_annotation (Ast_utils.sub_instrs i)
 
   (* [claims] counts the values the holes ABOVE are still owed: each takes the next
      residual, so the scan skips that many before asking whether what it reaches can
@@ -1434,7 +1471,7 @@ module Stack = struct
      one representative per entry class. A new arm (a new entry kind, a new claim
      shape) must add its representative there, or the guard degrades back to
      fuzzing luck for exactly that arm. *)
-  let rec effective_backing stop claims = function
+  let rec effective_backing stop ~crossed claims = function
     (* A CONSUMED value ([consume] marked it): it prints as its own statement,
        and on the re-parse the block-shaped consumer above takes it as its
        parameter — the very claim [hole_claims] charged for that consumer. The
@@ -1442,11 +1479,14 @@ module Stack = struct
        down and the scan pinned over a residual the hole in fact reconnects to
        (the backing-scan grid's Bp1 cluster: the pin materialised as an
        [any.convert_extern]). Spoken for, it can back nothing itself. *)
-    | (-1, _, _) :: rem -> effective_backing stop (max 0 (claims - 1)) rem
+    | (-1, _, _) :: rem ->
+        effective_backing stop ~crossed (max 0 (claims - 1)) rem
     | (0, _, i) :: _ when stop i -> `Blocked
-    | (0, _, i) :: _ when has_cond_annotation i && carries_untyped_hole i ->
-        `Blocked
-    | (0, _, i) :: rem -> effective_backing stop (claims + hole_claims i) rem
+    | (0, _, i) :: rem ->
+        effective_backing stop
+          ~crossed:(crossed || has_cond_annotation i)
+          (claims + hole_claims i)
+          rem
     (* Numeric by its width TAG, or by the type its producer RECORDED on it
        ([Ast.instr]'s [expected], which only ever holds a numeric scalar): either
        way it cannot be the reference operand, so keep scanning. The record is what
@@ -1461,15 +1501,24 @@ module Stack = struct
               match i.Ast.expected with
               | Ast.Recorded _ -> true
               | Ast.Unset | Ast.Contextual -> false) ->
-        (* Skipped either way; if holes above are still owed values, these are
-           the values they take — ALL of them for a multi-value entry (a record
-           on one means every result is non-reference, see
-           [functype_value_result]). *)
-        effective_backing stop (max 0 (claims - a)) rem
-    (* A value a hole above claims: not this hole's operand, so keep looking past
-       it. *)
-    | (a, None, _) :: rem when a >= 1 && claims > 0 ->
-        effective_backing stop (claims - 1) rem
+        (* If holes above are still owed values, these are the values they take
+           — ALL of them for a multi-value entry (a record on one means every
+           result is non-reference, see [functype_value_result]) — and the scan
+           keeps looking. But a value the claims do NOT absorb is what the
+           reader's own hole captures (claiming is positional and type-blind),
+           and it is provably a NON-reference: report [`Value] so the caller
+           grounds its hole with the claim-free bottom pin — a bare hole would
+           re-default the op to its numeric family, and a top-of-hierarchy pin
+           would capture the value and fail to type. Reachable only through an
+           [(@if)] (whose branches consume the value per configuration); in
+           plain wasm the validator types the residual into the reference op
+           and rejects. *)
+        if claims >= a then effective_backing stop ~crossed (claims - a) rem
+        else `Value
+    (* A value entry the holes above fully claim: not this hole's operand, so
+       keep looking past it. *)
+    | (a, None, _) :: rem when a >= 1 && claims >= a ->
+        effective_backing stop ~crossed (claims - a) rem
     (* An ADAPTIVE value — an untyped [select] of holes, or a bare hole — is not a
        backing: its own printed form carries no hierarchy, so on a re-parse the ref
        op's hole reconnects to it and the pair re-defaults to the NUMERIC form (a
@@ -1480,7 +1529,14 @@ module Stack = struct
        same unification (as it already does for such a value popped directly as the
        operand). *)
     | (a, None, i) :: _ when a >= 1 && reparse_adaptive i -> `Blocked
-    | (a, None, i) :: _ when a >= 1 -> `Backing i
+    (* The value the reader's hole captures. Claiming is POSITIONAL: the
+       [claims] still owed eat this entry's TOPMOST values, so the capture is
+       the entry's value [claims] positions from its top — 0 for a single-value
+       entry, and for a partially-claimed multi-value residual a middle result
+       (the classification indexes the signature accordingly; the old model
+       instead skipped the whole entry, losing the reference a claimed-past
+       multi still hands the hole — the VmultiER grid cells). *)
+    | (a, None, i) :: _ when a >= 1 -> `Backing (i, claims, crossed)
     (* The two no-backing outcomes are NOT the same: [`Floor] means the scan
        walked cleanly to the block's own floor — where the enclosing block's
        PARAMETERS are the next stack values, so a reference among them can still
@@ -1494,7 +1550,12 @@ module Stack = struct
     | [] -> `Floor
     | _ -> `Blocked
 
-  let effective_backing stop stack = (stack, effective_backing stop 0 stack)
+  (* [claims] seeds the scan with the hole count of the consulting statement's
+     SIBLING operands: a receiver is its statement's deepest operand, so its
+     positional capture sits below the values its shallower siblings' own holes
+     take first. *)
+  let effective_backing ?(claims = 0) stop stack =
+    (stack, effective_backing stop ~crossed:false claims stack)
 
   (* [try_pop] carrying the width tag — a method-form op tags its result with its
      receiver's flexibility, so an erasing consumer pins it (and the pin, cast on
@@ -1929,29 +1990,6 @@ let hierarchy_top (t : Ast.heaptype) =
   | Cont | NoCont -> Some `Cont
   | Type _ | Exact _ -> None
 
-(* Whether [b] — the residual [Stack.effective_backing] says a bare hole
-   reconnects to — is settled by its own printed form in the hierarchy [src]
-   (a convert's source), or is a null, which every hierarchy accepts. Only then
-   may a cross-hierarchy convert leave its absent operand BARE: the hole
-   reconnects to [b] and the convert's own [as] surface lowers over the real
-   value, one opcode, exactly the source. Pinned instead, the pin lands on the
-   reconnected value and materialises as a [ref.cast] the source never had (the
-   backing-scan grid's founding convert cluster). The other polarity is why
-   this must stay conservative: reconnection is type-directed, so over a
-   WRONG-hierarchy or unclassifiable backing the pinned hole reconnects to
-   nothing and the pin is the inert typed-hole ascription — keep it. *)
-let rec backing_in_hierarchy src (b : _ Ast.instr) =
-  match b.Ast.desc with
-  | Ast.Null -> true
-  | Ast.NonNull e -> backing_in_hierarchy src e
-  | Ast.Cast (_, Valtype (Ref { typ; _ })) -> hierarchy_top typ = Some src
-  | Ast.Cast (_, Functype _) -> src = `Func
-  | Ast.Struct _ | Ast.StructDefault _ | Ast.StructDesc _
-  | Ast.StructDefaultDesc _ | Ast.Array _ | Ast.ArrayFixed _
-  | Ast.ArraySegment _ | Ast.String _ ->
-      src = `Any
-  | _ -> false
-
 (* As [hierarchy_top], resolving a named type through the module's definitions
    (a struct/array type is in the [any] hierarchy, a func type in [func], a
    continuation type in [cont]); [None] when the name is unknown here (an
@@ -1969,30 +2007,47 @@ let heaptype_hierarchy ctx (t : Ast.heaptype) =
           | None -> None)
       | _ -> None)
 
-(* The hierarchies of the REFERENCE results in [results] — what a multi-value
-   call residual can hand a reconnecting hole (see [ctx.multi_ref_results]).
-   An unresolvable one is dropped from the list, which errs towards the pin
-   (the status quo for that value). *)
-let src_results_ref_hierarchies ctx (results : Src.valtype array) =
-  Array.to_list results
-  |> List.filter_map (fun t ->
-      match valtype ctx t with
-      | Ast.Ref { typ; _ } -> heaptype_hierarchy ctx typ
-      | _ -> None)
+(* The [backing_class] a value of heap type [t] presents: its hierarchy, and
+   whether it is provably an [eq]-subtype ([Any] itself and the unresolvable
+   named types are not). *)
+let heaptype_class ctx (t : Ast.heaptype) =
+  match heaptype_hierarchy ctx t with
+  | None -> Unknown_class
+  | Some hier -> Ref_class { hier; eq = hier = `Any && t <> Any }
 
-(* Whether a MULTI-VALUE backing residual contains a value of hierarchy [src]:
-   the shape [backing_in_hierarchy] cannot classify from the node alone, since
-   a call node does not name its results. A direct call is looked up by its
-   Wax name ([ctx.multi_ref_results], filled at emission); a [call_ref]'s
-   callee cast names the function type, resolved through the module. Only a
-   POSITIVE match lets a convert leave its hole bare — anything unresolvable
-   keeps the pin. *)
-let multi_backing_matches ctx src (b : _ Ast.instr) =
+let valtype_class ctx (t : Ast.valtype) =
+  match t with Ast.Ref { typ; _ } -> heaptype_class ctx typ | _ -> Value_class
+
+(* The per-result classes of a multi-value signature, in result order. *)
+let result_classes ctx (results : Src.valtype array) =
+  Array.map (fun t -> valtype_class ctx (valtype ctx t)) results
+
+(* The class of the result [from_top] positions below a residual's topmost
+   value — what the residual hands a reconnecting hole once the [from_top]
+   claims interposed holes are owed have eaten its top. *)
+let indexed_class (classes : backing_class array) ~from_top =
+  let i = Array.length classes - 1 - from_top in
+  if i < 0 then Unknown_class else classes.(i)
+
+(* Classify the residual [b] that [Stack.effective_backing] says a bare hole
+   reconnects to: what [b]'s own printed form re-types it as, when the node
+   (with the context's tables) can say. A [Get] is a local or global — whose
+   declared type is its re-parse type — or, when neither table knows the name,
+   a function reference. A multi-value call residual does not name its results
+   on the node: a direct call is looked up by its Wax name
+   ([ctx.multi_ref_results], filled at emission); a [call_ref]'s callee cast
+   names the function type, resolved through the module; a [call_indirect]
+   through an inline signature carries the (already converted) type itself.
+   Reconnection is POSITIONAL — the hole takes the residual's topmost value not
+   yet eaten by interposed claims — so a multi-value residual is indexed by
+   [from_top] (the scan's leftover claims); a single-value node with
+   [from_top > 0] cannot occur (the scan absorbs a fully-claimed entry). *)
+let rec backing_class_of ctx ~from_top (b : _ Ast.instr) =
   match b.Ast.desc with
   | Ast.Call ({ Ast.desc = Ast.Get f; _ }, _) -> (
       match Hashtbl.find_opt ctx.multi_ref_results f.Ast.desc with
-      | Some hs -> List.mem src hs
-      | None -> false)
+      | Some classes -> indexed_class classes ~from_top
+      | None -> Unknown_class)
   | Ast.Call
       ( {
           Ast.desc = Ast.Cast (_, Valtype (Ref { typ = Type tn | Exact tn; _ }));
@@ -2001,18 +2056,79 @@ let multi_backing_matches ctx src (b : _ Ast.instr) =
         _ ) -> (
       match src_typedef ctx tn with
       | Some { Src.typ = Func { results; _ }; _ } ->
-          List.mem src (src_results_ref_hierarchies ctx results)
-      | _ -> false)
-  (* A [call_indirect] through an inline signature: the callee cast carries the
-     (already converted) function type itself. *)
+          indexed_class (result_classes ctx results) ~from_top
+      | _ -> Unknown_class)
   | Ast.Call ({ Ast.desc = Ast.Cast (_, Functype { sign; _ }); _ }, _) ->
-      Array.exists
-        (fun (t : Ast.valtype) ->
-          match t with
-          | Ast.Ref { typ; _ } -> heaptype_hierarchy ctx typ = Some src
-          | _ -> false)
-        sign.Ast.results
-  | _ -> false
+      indexed_class (Array.map (valtype_class ctx) sign.Ast.results) ~from_top
+  | _ when from_top > 0 -> Unknown_class
+  | Ast.Null -> Null_class
+  | Ast.NonNull e -> backing_class_of ctx ~from_top e
+  | Ast.Cast (_, Valtype (Ref { typ; _ })) -> heaptype_class ctx typ
+  | Ast.Cast (_, Functype _) -> Ref_class { hier = `Func; eq = false }
+  | Ast.Struct _ | Ast.StructDefault _ | Ast.StructDesc _
+  | Ast.StructDefaultDesc _ | Ast.Array _ | Ast.ArrayFixed _
+  | Ast.ArraySegment _ | Ast.String _ ->
+      Ref_class { hier = `Any; eq = true }
+  | Ast.ContNew _ -> Ref_class { hier = `Cont; eq = false }
+  | Ast.Get n -> (
+      match Hashtbl.find_opt ctx.local_valtypes n.Ast.desc with
+      | Some t -> valtype_class ctx t
+      | None -> (
+          match Hashtbl.find_opt ctx.global_valtypes n.Ast.desc with
+          | Some t -> valtype_class ctx t
+          | None -> Ref_class { hier = `Func; eq = false }))
+  | _ -> Unknown_class
+
+(* Whether [b] is settled by its own printed form in the hierarchy [src] (a
+   convert's source), or is a null, which every hierarchy accepts. Only then
+   may a cross-hierarchy convert leave its absent operand BARE: the hole
+   reconnects to [b] and the convert's own [as] surface lowers over the real
+   value, one opcode, exactly the source. Pinned instead, the pin lands on the
+   reconnected value and materialises as a [ref.cast] the source never had (the
+   backing-scan grid's founding convert cluster). *)
+let backing_in_hierarchy ctx src ~from_top (b : _ Ast.instr) =
+  match backing_class_of ctx ~from_top b with
+  | Null_class -> true
+  | Ref_class { hier; _ } -> hier = src
+  | Value_class | Unknown_class -> false
+
+(* The opposite polarity: [b] provably re-types OUTSIDE the hierarchy [src] (a
+   wrong-hierarchy reference, or a non-reference value). A top-of-hierarchy pin
+   over such a backing would capture it and materialise as the very
+   hierarchy-crossing it should not add, so the caller pins the source
+   hierarchy's BOTTOM instead — the claim-free ascription (see
+   [is_bottom_heaptype]) that grounds the hole without touching [b]. Only an
+   [(@if)] can make this reachable: in plain Wasm the validator types the
+   residual into the consumer and rejects, while an annotation's branches
+   consume it only per configuration. An UNCLASSIFIABLE backing stays on the
+   top-of-hierarchy pin: in valid annotation-free input whatever the pin
+   captures is right-hierarchy (the validator typed it into the consumer), so
+   the pin is inert after unification — while a claim-free pin would strand
+   the residual the source consumed. *)
+let backing_wrong_hierarchy ctx src ~from_top (b : _ Ast.instr) =
+  match backing_class_of ctx ~from_top b with
+  | Ref_class { hier; _ } -> hier <> src
+  | Value_class -> true
+  | Null_class | Unknown_class -> false
+
+(* As [backing_wrong_hierarchy] for [ref.eq]: [b] provably re-types as
+   something other than an [eq]-subtype, so a bare [_ == _] hole capturing it
+   would not type-check (and an [(_ as &?eq)] pin capturing it would be a
+   hierarchy crossing). *)
+let backing_not_eq ctx ~from_top (b : _ Ast.instr) =
+  match backing_class_of ctx ~from_top b with
+  | Ref_class { eq; _ } -> not eq
+  | Value_class -> true
+  | Null_class | Unknown_class -> false
+
+(* As [backing_wrong_hierarchy] for [ref.is_null], which accepts every
+   reference: only a provable NON-reference re-typing is wrong (the bare [!_]
+   over it would re-default to [i32.eqz], and an [(_ as &?any)] pin over it
+   would not type-check). *)
+let backing_not_ref ctx ~from_top (b : _ Ast.instr) =
+  match backing_class_of ctx ~from_top b with
+  | Value_class -> true
+  | Ref_class _ | Null_class | Unknown_class -> false
 
 let rec convert_src ?(nullable = true) src e =
   match e.Ast.desc with
@@ -2581,6 +2697,151 @@ let is_poly_terminator (i : _ Ast.instr) =
       true
   | _ -> false
 
+(* Whether two source signatures convert to the same Wax signature — compared
+   on the printed converted types, locations aside (the [collapse_splices]
+   trick). Used by [pin_callee]: a captured function value of the SAME
+   signature satisfies the callee pin as written (the pin drops as redundant
+   and the call reads the value, exactly as the source instruction did).
+   Deliberately equality, not subtyping (which this module cannot decide): a
+   proper-subtype capture behind an annotation falls back to the claim-free
+   bottom pin, which is inert there. *)
+let same_signature ctx (a : Src.functype) (b : Src.functype) =
+  let print (ft : Src.functype) =
+    Wax_utils.Printer.run_string (fun pp ->
+        Array.iter
+          (fun p ->
+            Wax_lang.Output.valtype pp (valtype ctx (snd p.Wax_utils.Ast.desc));
+            Wax_utils.Printer.string pp "->")
+          ft.Src.params;
+        Array.iter
+          (fun t ->
+            Wax_lang.Output.valtype pp (valtype ctx t);
+            Wax_utils.Printer.string pp ",")
+          ft.Src.results)
+  in
+  String.equal (print a) (print b)
+
+(* The [call_ref]/[return_call_ref] callee type pin [(_ as &?t)] for an ABSENT
+   callee (a pop off the polymorphic stack). The cast names the instruction's
+   type immediate, so it must survive — but its hole claims positionally, and
+   behind a conditional annotation (the scan's [crossed]) the captured value
+   may be anything the branches consume per configuration: a wrong-hierarchy or
+   non-reference capture poisons the cast, and a func capture of a DIFFERENT
+   signature materialises the pin as a [ref.cast] the source never had. Ground
+   such a hole with the claim-free func-hierarchy bottom INSIDE the type pin —
+   [((_ as &?nofunc) as &?t)] claims nothing, still names [t], and lowers to no
+   instruction — and keep the plain pin everywhere else: with no annotation in
+   between, a captured value is the very callee the source popped (the
+   validator typed it there), so the claim is load-bearing and sound. *)
+let pin_callee ctx t (f : _ Ast.instr) =
+  let target : Ast.valtype =
+    Ref { nullable = true; typ = Type (idx ctx `Type t) }
+  in
+  let pin inner = { f with Ast.desc = Ast.Cast (inner, Valtype target) } in
+  match f.Ast.desc with
+  | Ast.Hole ->
+      let* backing = Stack.effective_backing is_poly_terminator in
+      let wrong =
+        match backing with
+        | `Value -> true
+        | `Backing (b, from_top, crossed) -> (
+            crossed
+            &&
+            match backing_class_of ctx ~from_top b with
+            | Null_class -> false
+            | Value_class -> true
+            | Unknown_class -> false
+            | Ref_class { hier; _ } -> (
+                hier <> `Func
+                ||
+                match b.Ast.desc with
+                | Ast.Get g -> (
+                    match
+                      ( (try
+                           Some
+                             (CondTbl.find ctx.function_types ctx.cond_asm
+                                g.Ast.desc)
+                         with Not_found -> None),
+                        typeuse_functype ctx (Some t, None) )
+                    with
+                    | Some gtu, Some tft -> (
+                        match typeuse_functype ctx gtu with
+                        | Some gft -> not (same_signature ctx gft tft)
+                        | None -> true)
+                    | _ -> true)
+                | _ -> true))
+        | `Floor | `Blocked -> false
+      in
+      let inner =
+        if wrong then
+          cast_to (Valtype (Ref { nullable = true; typ = NoFunc })) f
+        else f
+      in
+      return (pin inner)
+  | _ -> return (pin f)
+
+(* Whether the residual's own printed form names exactly the type [type_name] —
+   the one capture a [(_ as &?type_name)] receiver pin provably absorbs as
+   written (the pin drops as redundant and the access reads the value, exactly
+   as the source instruction did). *)
+let backing_names_type ~from_top (b : _ Ast.instr) (type_name : Ast.ident) =
+  from_top = 0
+  &&
+  match b.Ast.desc with
+  | Ast.Cast (_, Valtype (Ref { typ = Type n | Exact n; _ })) ->
+      String.equal n.Ast.desc type_name.Ast.desc
+  | _ -> false
+
+(* The member-access receiver type pin [(recv as &?t)] (a struct/array read,
+   write, fill/copy/init receiver) for an ABSENT receiver, as [pin_callee] for
+   a callee: behind a conditional annotation ([crossed]) a positional capture
+   the pin cannot absorb — a value outside [t]'s hierarchy, a non-reference, or
+   a reference whose printed form names a DIFFERENT type — either poisons the
+   access (and the lowering, which reads the struct/array type off the
+   receiver, has nothing to emit) or materialises the pin as a [ref.cast] the
+   source never had. Ground such a hole with the claim-free bottom of [t]'s
+   hierarchy inside the type pin — [((_ as &?none) as &?t)] still names [t] —
+   and keep the plain pin everywhere else (with no annotation in between a
+   captured value is the receiver the source instruction read, validator-typed
+   there). [siblings] are the statement's shallower operands, whose own hole
+   claims sit between this receiver's hole and its capture. *)
+let pin_receiver ctx type_name ~siblings (recv : _ Ast.instr) =
+  let target : Ast.valtype = Ref { nullable = true; typ = Type type_name } in
+  let pin inner = { recv with Ast.desc = Ast.Cast (inner, Valtype target) } in
+  match recv.Ast.desc with
+  | Ast.Hole ->
+      let claims =
+        List.fold_left (fun n e -> n + Stack.hole_claims e) 0 siblings
+      in
+      let* backing = Stack.effective_backing ~claims is_poly_terminator in
+      let wrong =
+        match backing with
+        | `Value -> true
+        | `Backing (b, from_top, crossed) -> (
+            crossed
+            && (not (backing_names_type ~from_top b type_name))
+            &&
+            match backing_class_of ctx ~from_top b with
+            | Null_class | Unknown_class -> false
+            | Value_class | Ref_class _ -> true)
+        | `Floor | `Blocked -> false
+      in
+      let bottom : Ast.heaptype =
+        match heaptype_hierarchy ctx (Type type_name) with
+        | Some `Func -> NoFunc
+        | Some `Extern -> NoExtern
+        | Some `Exn -> NoExn
+        | Some `Cont -> NoCont
+        | Some `Any | None -> None_
+      in
+      let inner =
+        if wrong then
+          cast_to (Valtype (Ref { nullable = true; typ = bottom })) recv
+        else recv
+      in
+      return (pin inner)
+  | _ -> return (pin recv)
+
 (* Pin the reference HIERARCHY of an operand that leaves it open: a hole is
    polymorphic, and [!e] ([ref.as_non_null]) only forwards its operand's type. The
    pin is pushed down to the hole ITSELF rather than wrapped around the [!] —
@@ -2966,7 +3227,7 @@ and instruction_desc ctx (i : _ Src.instr) : unit Stack.t =
       (* Record the target's numeric type on the assigned VALUE too, not only on a
          [Get]: a hole assigned to a numeric local is a hole the re-parse types
          numerically, which is what [Stack.effective_backing] needs to know to see
-         past the statement (see [carries_untyped_hole]). *)
+         past the statement (see [hole_claims]). *)
       let name = idx ctx `Local x in
       let* e = Stack.pop in
       Stack.push 0 (with_loc (set_desc name (expect_local ctx name e)))
@@ -3031,14 +3292,7 @@ and instruction_desc ctx (i : _ Src.instr) : unit Stack.t =
       let type_name = idx ctx `Type t in
       let name = Sequence.get (fst (struct_fields ctx type_name)) f in
       let* arg = Stack.pop in
-      let arg =
-        {
-          arg with
-          desc =
-            Ast.Cast
-              (arg, Valtype (Ref { nullable = true; typ = Type type_name }));
-        }
-      in
+      let* arg = pin_receiver ctx type_name ~siblings:[] arg in
       let e = with_loc (StructGet (arg, name)) in
       Stack.push 1
         (match s with
@@ -3056,14 +3310,7 @@ and instruction_desc ctx (i : _ Src.instr) : unit Stack.t =
       let name = Sequence.get (fst (struct_fields ctx type_name)) f in
       let* e2 = Stack.pop in
       let* e1 = Stack.pop in
-      let e1 =
-        {
-          e1 with
-          desc =
-            Ast.Cast
-              (e1, Valtype (Ref { nullable = true; typ = Type type_name }));
-        }
-      in
+      let* e1 = pin_receiver ctx type_name ~siblings:[ e2 ] e1 in
       Stack.push 0 (with_loc (StructSet (e1, name, e2)))
   | ArrayNew t ->
       let* len = Stack.pop in
@@ -3098,16 +3345,7 @@ and instruction_desc ctx (i : _ Src.instr) : unit Stack.t =
   | ArrayGet (s, t) ->
       let* e2 = Stack.pop in
       let* e1 = Stack.pop in
-      let e1 =
-        {
-          e1 with
-          desc =
-            Ast.Cast
-              ( e1,
-                Valtype (Ref { nullable = true; typ = Type (idx ctx `Type t) })
-              );
-        }
-      in
+      let* e1 = pin_receiver ctx (idx ctx `Type t) ~siblings:[ e2 ] e1 in
       let e = with_loc (ArrayGet (e1, e2)) in
       Stack.push 1
         (match s with
@@ -3124,16 +3362,7 @@ and instruction_desc ctx (i : _ Src.instr) : unit Stack.t =
       let* e3 = Stack.pop in
       let* e2 = Stack.pop in
       let* e1 = Stack.pop in
-      let e1 =
-        {
-          e1 with
-          desc =
-            Ast.Cast
-              ( e1,
-                Valtype (Ref { nullable = true; typ = Type (idx ctx `Type t) })
-              );
-        }
-      in
+      let* e1 = pin_receiver ctx (idx ctx `Type t) ~siblings:[ e2; e3 ] e1 in
       Stack.push 0 (with_loc (ArraySet (e1, e2, e3)))
   | Call f ->
       let input, output = function_arity ctx f in
@@ -3148,7 +3377,7 @@ and instruction_desc ctx (i : _ Src.instr) : unit Stack.t =
          match typeuse_functype ctx tu with
          | Some { Src.results; _ } ->
              Hashtbl.replace ctx.multi_ref_results name.Ast.desc
-               (src_results_ref_hierarchies ctx results)
+               (result_classes ctx results)
          | None -> ());
       Stack.push output
         (expect_value_result
@@ -3158,16 +3387,7 @@ and instruction_desc ctx (i : _ Src.instr) : unit Stack.t =
       let input, output = type_arity ctx t in
       let result_ty = type_value_result ctx t in
       let* f = Stack.pop in
-      let f =
-        {
-          f with
-          desc =
-            Ast.Cast
-              ( f,
-                Valtype (Ref { nullable = true; typ = Type (idx ctx `Type t) })
-              );
-        }
-      in
+      let* f = pin_callee ctx t f in
       let* args = Stack.grab input in
       Stack.push output
         (expect_value_result result_ty (with_loc (Call (f, args))))
@@ -3179,16 +3399,7 @@ and instruction_desc ctx (i : _ Src.instr) : unit Stack.t =
   | ReturnCallRef t ->
       let input, _ = type_arity ctx t in
       let* f = Stack.pop in
-      let f =
-        {
-          f with
-          desc =
-            Ast.Cast
-              ( f,
-                Valtype (Ref { nullable = true; typ = Type (idx ctx `Type t) })
-              );
-        }
-      in
+      let* f = pin_callee ctx t f in
       let* args = Stack.grab input in
       Stack.push_poly (with_loc (TailCall (f, args)))
   | Return ->
@@ -3272,7 +3483,16 @@ and instruction_desc ctx (i : _ Src.instr) : unit Stack.t =
          lowers over the real value — the pin would land on that reconnected
          value instead and materialise as a [ref.cast] the source never had
          (the backing-scan grid's founding convert cluster). Left bare, the
-         result stays NULLABLE: the reconnected value may be a null. *)
+         result stays NULLABLE: the reconnected value may be a null.
+
+         And over a backing provably OUTSIDE the source hierarchy — reachable
+         only through an [(@if)], whose branches consume it per configuration —
+         neither works: bare, the hole takes the wrong-hierarchy value and the
+         convert collapses into (or compounds with) a crossing the source never
+         had; pinned at the source TOP, the pin captures that value and
+         materialises the same crossing. The source hierarchy's BOTTOM is the
+         claim-free pin that grounds the hole and leaves the residual to the
+         branch that consumes it (see [backing_wrong_hierarchy]). *)
       let src : Ast.valtype = Ref { nullable = true; typ = Any } in
       let* () = pin_forwarding_source src in
       let* e = Stack.pop in
@@ -3281,8 +3501,16 @@ and instruction_desc ctx (i : _ Src.instr) : unit Stack.t =
         is_bare_hole e
         &&
         match backing with
-        | `Backing b ->
-            backing_in_hierarchy `Any b || multi_backing_matches ctx `Any b
+        | `Backing (b, from_top, _) -> backing_in_hierarchy ctx `Any ~from_top b
+        | `Value | `Floor | `Blocked -> false
+      in
+      let wrong =
+        is_bare_hole e
+        &&
+        match backing with
+        | `Backing (b, from_top, _) ->
+            backing_wrong_hierarchy ctx `Any ~from_top b
+        | `Value -> true
         | `Floor | `Blocked -> false
       in
       (* A bare hole is pinned NON-NULL and the convert preserves non-nullness, so
@@ -3291,12 +3519,18 @@ and instruction_desc ctx (i : _ Src.instr) : unit Stack.t =
          under [--faithful] — there the nullable target made the decompiled Wax
          ill-typed against a non-null consumer. *)
       let nullable = backed || not (is_bare_hole e) in
-      let operand = if backed then e else convert_src ~nullable src e in
+      let operand =
+        if backed then e
+        else if wrong then
+          cast_to (Valtype (Ref { nullable = false; typ = None_ })) e
+        else convert_src ~nullable src e
+      in
       Stack.push 1
         (with_loc (Cast (operand, Valtype (Ref { nullable; typ = Extern }))))
   | AnyConvertExtern ->
       (* Source is [&?extern]; a dead-code hole is pinned [(_ as &?extern)] so the
-         conversion survives — except over an extern-hierarchy backing, exactly as
+         conversion survives — except over an extern-hierarchy backing, and with
+         the wrong-hierarchy bottom pin [(_ as &noextern)], exactly as
          [ExternConvertAny] above. A forwarding [br_on_null] residual on top has
          its tested ref pinned to the source. *)
       let src : Ast.valtype = Ref { nullable = true; typ = Extern } in
@@ -3307,14 +3541,27 @@ and instruction_desc ctx (i : _ Src.instr) : unit Stack.t =
         is_bare_hole e
         &&
         match backing with
-        | `Backing b ->
-            backing_in_hierarchy `Extern b
-            || multi_backing_matches ctx `Extern b
+        | `Backing (b, from_top, _) ->
+            backing_in_hierarchy ctx `Extern ~from_top b
+        | `Value | `Floor | `Blocked -> false
+      in
+      let wrong =
+        is_bare_hole e
+        &&
+        match backing with
+        | `Backing (b, from_top, _) ->
+            backing_wrong_hierarchy ctx `Extern ~from_top b
+        | `Value -> true
         | `Floor | `Blocked -> false
       in
       (* As [ExternConvertAny]: a non-null pin gives a non-null result. *)
       let nullable = backed || not (is_bare_hole e) in
-      let operand = if backed then e else convert_src ~nullable src e in
+      let operand =
+        if backed then e
+        else if wrong then
+          cast_to (Valtype (Ref { nullable = false; typ = NoExtern })) e
+        else convert_src ~nullable src e
+      in
       Stack.push 1
         (with_loc (Cast (operand, Valtype (Ref { nullable; typ = Any }))))
   | ArrayNewData (t, d) ->
@@ -3467,19 +3714,42 @@ and instruction_desc ctx (i : _ Src.instr) : unit Stack.t =
       let backs o = Option.is_some o && not (is_select o) in
       let backed =
         backs o1 || backs o2
-        || match backing with `Backing _ -> true | `Floor | `Blocked -> false
+        ||
+        match backing with
+        | `Backing _ -> true
+        | `Value | `Floor | `Blocked -> false
+      in
+      (* A backing that provably re-types as something OTHER than an
+         [eq]-subtype — an extern/func-hierarchy reference or a non-reference
+         multi-value residual, reachable only through an [(@if)] whose branches
+         consume it per configuration: a bare hole would capture it and the
+         [==] would not type-check (or re-default numeric). Ground each hole
+         with the claim-free bottom [(_ as &?none)] instead, leaving the value
+         to the branch that consumes it (see [backing_not_eq]). *)
+      let wrong =
+        match backing with
+        | `Backing (b, from_top, _) -> backing_not_eq ctx ~from_top b
+        | `Value -> true
+        | `Floor | `Blocked -> false
+      in
+      let bottom_pin e =
+        Ast.no_loc_instr
+          (Ast.Cast (e, Valtype (Ref { nullable = true; typ = None_ })))
       in
       let e1 =
         match o1 with
         | Some ({ Ast.desc = Ast.Select _; _ } as e) -> eq_pin e
         | Some e -> e
-        | None -> if backed then bare else eq_pin bare
+        | None ->
+            if wrong then bottom_pin bare
+            else if backed then bare
+            else eq_pin bare
       in
       let e2 =
         match o2 with
         | Some ({ Ast.desc = Ast.Select _; _ } as e) -> eq_pin e
         | Some e -> e
-        | None -> bare
+        | None -> if wrong then bottom_pin (bare_hole ()) else bare
       in
       Stack.push 1
         (expect I32 (with_loc (BinOp (op_loc i.info Ast.Eq, e1, e2))))
@@ -3516,6 +3786,16 @@ and instruction_desc ctx (i : _ Src.instr) : unit Stack.t =
         Ast.no_loc_instr
           (Ast.Cast (e, Valtype (Ref { nullable = true; typ = Any })))
       in
+      (* The claim-free bottom pin, for a hole whose positional capture would
+         be a provable NON-reference (see [backing_not_ref] and the scan's
+         [`Value] verdict): [(_ as &?none)] grounds the hole without taking a
+         pending value, so the numeric residual stays for the [(@if)] branch
+         that consumes it. *)
+      let ref_bottom_pin () =
+        Ast.no_loc_instr
+          (Ast.Cast
+             (bare_hole (), Valtype (Ref { nullable = true; typ = None_ })))
+      in
       (* The innermost enclosing block's own parameters are its first stack
          values, so a REFERENCE among them backs this hole exactly as a value
          residual does: the hole reconnects to the parameter on re-parse and takes
@@ -3535,12 +3815,21 @@ and instruction_desc ctx (i : _ Src.instr) : unit Stack.t =
             | Src.Ref _ -> true
             | _ -> false)
       in
+      (* A backing that provably re-types as a NON-reference (a multi-value
+         residual whose last result is numeric — reachable as a hole's backing
+         only through an [(@if)] whose branches consume it per configuration):
+         a bare [!_] capturing it re-defaults to [i32.eqz], and the [(_ as
+         &?any)] pin capturing it does not type-check. Ground the hole with the
+         claim-free bottom [(_ as &?none)] instead (see [backing_not_ref]). *)
       let e =
         match o with
         | Some ({ Ast.desc = Ast.Select _; _ } as e) -> any_pin e
         | Some e -> e
         | None -> (
             match backing with
+            | `Value -> ref_bottom_pin ()
+            | `Backing (b, from_top, _) when backing_not_ref ctx ~from_top b ->
+                ref_bottom_pin ()
             | `Backing _ -> bare_hole ()
             | `Floor when backed_by_block_param -> bare_hole ()
             | `Floor | `Blocked -> any_pin (bare_hole ()))
@@ -3700,7 +3989,7 @@ and instruction_desc ctx (i : _ Src.instr) : unit Stack.t =
       let* v = Stack.pop in
       let* i = Stack.pop in
       let* a = Stack.pop in
-      let a = cast_ref a (Type (idx ctx `Type t)) in
+      let* a = pin_receiver ctx (idx ctx `Type t) ~siblings:[ i; v; n ] a in
       Stack.push 0
         (with_loc
            (Call (with_loc (StructGet (a, Ast.no_loc "fill")), [ i; v; n ])))
@@ -3710,8 +3999,10 @@ and instruction_desc ctx (i : _ Src.instr) : unit Stack.t =
       let* a2 = Stack.pop in
       let* i1 = Stack.pop in
       let* a1 = Stack.pop in
-      let a1 = cast_ref a1 (Type (idx ctx `Type t1)) in
-      let a2 = cast_ref a2 (Type (idx ctx `Type t2)) in
+      let* a2 = pin_receiver ctx (idx ctx `Type t2) ~siblings:[ i2; n ] a2 in
+      let* a1 =
+        pin_receiver ctx (idx ctx `Type t1) ~siblings:[ i1; a2; i2; n ] a1
+      in
       Stack.push 0
         (with_loc
            (Call
@@ -3961,7 +4252,7 @@ and instruction_desc ctx (i : _ Src.instr) : unit Stack.t =
       let* s = Stack.pop in
       let* d = Stack.pop in
       let* a = Stack.pop in
-      let a = cast_ref a (Type (idx ctx `Type t)) in
+      let* a = pin_receiver ctx (idx ctx `Type t) ~siblings:[ d; s; n ] a in
       let seg = with_loc (Ast.Get (idx ctx `Data data)) in
       Stack.push 0
         (with_loc
@@ -3971,7 +4262,7 @@ and instruction_desc ctx (i : _ Src.instr) : unit Stack.t =
       let* s = Stack.pop in
       let* d = Stack.pop in
       let* a = Stack.pop in
-      let a = cast_ref a (Type (idx ctx `Type t)) in
+      let* a = pin_receiver ctx (idx ctx `Type t) ~siblings:[ d; s; n ] a in
       let seg = with_loc (Ast.Get (idx ctx `Elem elem)) in
       Stack.push 0
         (with_loc

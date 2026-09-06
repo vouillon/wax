@@ -3316,9 +3316,27 @@ let rec list_split n l =
    operand does; every other operand emits at least one value-producing
    instruction. Static receivers (memory/table/segment names, a [tab[..]] table)
    are immediates, not operands, and never reach here. *)
+(* A bare hole under a BOTTOM reference ascription — possibly under a further
+   type pin, as in the [((_ as &?none) as &?t)] receiver/callee shape: the
+   whole chain is the claim-free pin (see [count_holes]) and lowers to no
+   instruction. *)
+let rec is_claim_free_pin (node : _ Ast.instr) =
+  match node.desc with
+  | Cast
+      ( { desc = Hole; _ },
+        Valtype (Ref { typ = None_ | NoFunc | NoExtern | NoExn | NoCont; _ }) )
+    ->
+      true
+  | Cast (inner, _) -> is_claim_free_pin inner
+  | _ -> false
+
 let rec emits_value ctx (node : _ Ast.instr) =
   match node.desc with
   | Hole -> false
+  (* The claim-free pin names a value off the polymorphic bottom and lowers to
+     no instruction, so — like the bare hole — it emits nothing a following
+     hole's value could hide behind. *)
+  | Cast _ when is_claim_free_pin node -> false
   | Cast (inner, _) when cast_is_transparent ctx ~cast:node ~operand:inner ->
       emits_value ctx inner
   | _ -> true
@@ -4470,6 +4488,18 @@ let bump_value_loc ctx st node =
 let rec count_holes i =
   match i.desc with
   | Hole -> 1
+  (* A bare hole ascribed a BOTTOM reference type ([_ as &?none], [_ as
+     &noextern], …) claims NO pending value: nothing but a null or a value off
+     the polymorphic stack bottom of dead code inhabits such a type, so it
+     denotes the stack bottom itself rather than standing for a stranded
+     enclosing value. This is what makes it a safe dead-code pin for
+     [From_wasm]: the ascription grounds its hole's hierarchy without capturing
+     a residual that another consumer (or an [(@if)] branch, in its own
+     configuration) reconnects to. Typed without a pending value in
+     [type_cast]'s matching special case. *)
+  | Cast ({ desc = Hole; _ }, Valtype (Ref { typ; _ }))
+    when is_bottom_heaptype typ ->
+      0
   | BinOp (_, l, r)
   | Array (_, l, r)
   | ArraySegment (_, _, l, r)
@@ -6186,7 +6216,16 @@ and type_cast ctx i =
       let inner_cast_type =
         match i'.desc with Cast (_, t) -> Some t | _ -> None
       in
-      let* i' = instruction ctx i' in
+      (* A bare hole under a BOTTOM reference ascription claims no pending value
+         (its [count_holes] is 0 — see there): type it directly as an unresolved
+         reference off the polymorphic bottom rather than through
+         [pop_parameter], which would hand it a recovery [Error] cell. *)
+      let* i' =
+        match (i'.desc, typ) with
+        | Hole, Valtype (Ref { typ = t; _ }) when is_bottom_heaptype t ->
+            return_expression i' Hole (Cell.make UnknownRef)
+        | _ -> instruction ctx i'
+      in
       (* The inner cast type to RE-INSERT if it was dropped below (i.e. the result
          is no longer a cast) and dropping it would lose the outer instruction. The
          wrap is applied at the final kept-cast return, NOT here, so it does not
