@@ -1851,7 +1851,18 @@ let rec subtype ?location ?(pin = true) ctx ty ty' =
      concrete types it accepts are i64, f32 and f64. *)
   | LargeInt, Valtype { internal = I64 | F32 | F64; _ }
   | Null, Valtype { internal = Ref { nullable = true; _ }; _ } ->
-      Cell.merge ty ty' ity';
+      (* Settle the flexible value AT the concrete expected type — by SETTING
+         its own cell, never by union-ing it into the expected cell (as the
+         [Unknown]/[UnknownRef] pins below already do). The expected side is
+         often one of the SHARED base cells ([i32_cell] and kin), whose safety
+         argument is that their contents never change; a union would alias the
+         value's tree onto the shared cell, and a later [Cell.set] on that tree
+         — the width reconciliation's repair pin re-grounding a mis-captured
+         dead-code hole tree — would then rewrite the shared cell and retype
+         every node in the module holding it (a backing-scan (@if) grid
+         finding: one repaired [i64.add] turned every [ref.is_null] result
+         [i64]). *)
+      Cell.set ty ity';
       true
   | ( Null,
       Valtype
