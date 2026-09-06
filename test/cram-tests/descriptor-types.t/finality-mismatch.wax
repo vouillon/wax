@@ -1,0 +1,6 @@
+rec {
+  type a = open descriptor b { };
+  type b = describes a { };
+}
+#[export = "g"]
+const g: &?a = null;

@@ -820,6 +820,11 @@ module Error = struct
     report context ~location ~severity:Error
       (text "A described type must be declared before its descriptor.")
 
+  let descriptor_finality_mismatch context ~location =
+    report context ~location ~severity:Error
+      ((text "A type and its descriptor must both be" ++ kw "final")
+      ^^ text ", or neither.")
+
   let descriptor_not_struct context ~location ~described =
     report context ~location ~severity:Error
       (text "A"
@@ -4652,9 +4657,15 @@ let add_type d ctx ty =
               Error.descriptor_outside_rec_group d ~location ~described:false
           | Some (Rec pos) -> (
               (* This type is described by [ty'.(pos)]; that descriptor must
-                 describe this type back. *)
+                 describe this type back, and share its finality: an open type
+                 whose descriptor is final (or the reverse) could never be
+                 extended, since a subtype would need a descriptor extending a
+                 final one. Reported here only, on the described type, so the
+                 reciprocal pair yields a single error. *)
               match ty'.(pos).describes with
-              | Some (Rec o) when o = i -> ()
+              | Some (Rec o) when o = i ->
+                  if sub.final <> ty'.(pos).final then
+                    Error.descriptor_finality_mismatch d ~location
               | _ ->
                   Error.descriptor_not_reciprocal d ~location ~described:false));
           (match sub.describes with

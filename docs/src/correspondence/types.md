@@ -144,6 +144,10 @@ validation:
 - the clauses must be **reciprocal**: if `obj` names `obj_desc` as its
   descriptor, then `obj_desc` must describe `obj`;
 - a described type must be declared **before** its descriptor;
+- the two must **agree on finality**: both `open`, or neither. An open type with
+  a final descriptor could never be extended, since a subtype of it would need a
+  descriptor extending a final type, and a final type with an open descriptor
+  leaves that descriptor with no possible subtypes either;
 - in a subtype hierarchy, a type has a descriptor exactly when its declared
   supertype does (with a descriptor that is itself a subtype), and a described
   type is inherited covariantly.

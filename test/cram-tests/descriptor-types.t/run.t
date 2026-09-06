@@ -79,7 +79,32 @@ presence must match along the declared subtype chain.
   3 │     (type $a (sub (struct)))
   4 │     (type $b (sub $a (descriptor $b_desc) (struct)))
     ·     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  5 │     (type $b_desc (describes $b) (struct))))
+  5 │     (type $b_desc (sub (describes $b) (struct)))))
   6 │ 
   [128]
 
+
+A type and its descriptor must also agree on finality. An open type with a final
+descriptor could never be extended, since a subtype of it would need a
+descriptor extending a final type; a final type with an open descriptor leaves
+that descriptor with no possible subtypes either.
+
+  $ wax check -X custom-descriptors finality-mismatch.wax
+  Error: A type and its descriptor must both be 'open', or neither.
+   ──➤  finality-mismatch.wax:2:3
+  1 │ rec {
+  2 │   type a = open descriptor b { };
+    ·   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  3 │   type b = describes a { };
+  4 │ }
+  [128]
+  $ wax check -X custom-descriptors finality-mismatch.wat
+  Error: A type and its descriptor must both be 'final', or neither.
+   ──➤  finality-mismatch.wat:3:5
+  1 │ (module
+  2 │   (rec
+  3 │     (type $a (sub final (descriptor $b) (struct)))
+    ·     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  4 │     (type $b (sub (describes $a) (struct))))
+  5 │   (global (export "g") (ref null $a) (ref.null $a)))
+  [128]
