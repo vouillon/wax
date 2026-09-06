@@ -33,6 +33,9 @@
 #               Vmulti multi-value residual   (call returning two i64)
 #               VmultiRE ref-carrying multi   (call returning i64 + externref)
 #               VmultiRC as VmultiRE via call_ref (the type-named callee shape)
+#               VmultiER ref-then-numeric multi (call returning externref + i64:
+#               reconnection is positional, so the LAST result — here a
+#               non-reference — is what the hole would capture)
 #               RnullX exn-hierarchy null     (ref.null exn)
 #               Rcont  cont-hierarchy ref     (cont.new)
 #   statements  S0    no claim                (atomic.fence)
@@ -54,15 +57,18 @@
 # MAINTENANCE: a new match arm in [effective_backing]/[statement_claims] must
 # add its representative here (there is no mechanical table to derive this
 # from — a pointer comment sits on the scan). The ScondEq/ScondNe symbols
-# (conditional annotations) are enumerated but their cells are ACKNOWLEDGED
-# wholesale ([exempt_shape]): the (@if) x dead-code corner is a known-open
-# finding set — ~400 pre-existing conversion crashes and reconnection drift
-# under every semantics tried against this grid (the opaque pin, equal-branch
-# claims, branch-scoped zero claims) — recorded in ATIF-DEADCODE.md at the
-# repo root, which also sketches the fix direction (convert pins aimed at the
-# source hierarchy's BOTTOM). Only (@if) can build the hazard: plain wasm's
-# validator types the residual into the consumer and rejects. Remove the
-# exemption with the fix; these cells then become its calibration.
+# (conditional annotations) were once ACKNOWLEDGED wholesale as the known-open
+# (@if) x dead-code corner (ATIF-DEADCODE.md's ~1400-finding set: conversion
+# crashes plus reconnection drift under every claims model tried); the corner
+# is fixed — the scan models the PRESERVED-tree typing (an annotation claims
+# nothing; each branch is an isolated void block there), the spliced
+# configuration passes mirror the source's own pops by construction, and a
+# backing that provably re-types OUTSIDE what the reader's pin could ascribe
+# gets the claim-free BOTTOM pin ([(_ as &?none)] and kin, which the typer
+# gives no pending value) instead of a capturing top-of-hierarchy pin — and
+# these cells are now ordinary calibration. Only (@if) can build the
+# wrong-hierarchy-backing hazard: plain wasm's validator types the residual
+# into the consumer and rejects.
 #
 # Every sequence of entries up to DEPTH (default 3; the founding bug sits at
 # depth one via S2c, at two spelled out) is
@@ -127,6 +133,7 @@ sym Radapt "select"
 sym Vmulti "call \$f2"
 sym VmultiRE "call \$f3"
 sym VmultiRC "call_ref \$ft3"
+sym VmultiER "call \$f4"
 sym RnullX "ref.null exn"
 sym Rcont  "cont.new \$ct"
 sym S0     "atomic.fence"
@@ -174,21 +181,6 @@ rdr cvt    "any.convert_extern" "any.convert_extern|drop"
 # count, per opcode).
 CROSSERS=(any.convert_extern extern.convert_any ref.cast ref.test)
 
-# A cell EXEMPT by shape: any sequence containing a conditional annotation.
-# The (@if) x dead-code corner is a KNOWN-OPEN finding set, not a passing
-# surface — see ATIF-DEADCODE.md at the repo root: ~400 conversion CRASHES
-# (both directions) and reconnection drift under every semantics tried (the
-# scan's opaque pin, equal-branch claims, branch-scoped zero claims — each
-# refuted by a cell this grid produced). It needs a designed answer (the
-# report sketches the source-hierarchy-bottom pin direction) rather than
-# another modeled guess; only (@if) can even build the hazard, since plain
-# wasm's validator types the residual into the consumer and rejects. The
-# symbols stay enumerated so the corner is measured; REMOVE this exemption
-# with the fix, and the cells become the calibration.
-exempt_shape() { # $1 = symbol path (the cell name), $2 = reader name
-  case "$1" in *Scond*) return 0 ;; *) return 1 ;; esac
-}
-
 template() { # $1 = |-separated instruction list
   local body
   body="$(printf '%s' "$1" | tr '|' '\n' | sed 's/^/    /')"
@@ -203,6 +195,7 @@ template() { # $1 = |-separated instruction list
   (type \$ct (cont \$ft0))
   (type \$ft3 (func (result i64 externref)))
   (func \$f3 (result i64 externref) (i64.const 1) (ref.null extern))
+  (func \$f4 (result externref i64) (ref.null extern) (i64.const 1))
   (func (local \$l64 i64)
     return
 $body))
@@ -231,7 +224,7 @@ count_ops() { # $1 = file, $2 = opcode; occurrences, word-anchored
 }
 
 worker() {
-  local first="$1" last="$2" i name ridx codes v mode out="" skipped=0 acked=0
+  local first="$1" last="$2" i name ridx codes v mode out="" skipped=0
   local p="$RESULTS/w$first"
   local wat="$p.wat" wax="$p.wax" back="$p.back.wat"
   ERRLOG="$p.err"
@@ -248,11 +241,6 @@ worker() {
     template "$codes" >"$wat"
     if [ "$(classify_wax check "$wat")" != ok ]; then
       skipped=$((skipped + 1)); printf s >&2; continue
-    fi
-    # The acknowledged (@if) corner: whole cell skipped, counted, owned by
-    # ATIF-DEADCODE.md (see [exempt_shape]).
-    if exempt_shape "$name" "${R_NAME[$ridx]}"; then
-      acked=$((acked + 1)); printf a >&2; continue
     fi
     for mode in "" "--faithful"; do
       v="$(classify_wax -i wat -f wax $mode --error-format short "$wat" -o "$wax")"
@@ -288,7 +276,6 @@ worker() {
   done
   [ -n "$out" ] && printf '%s' "$out" >"$RESULTS/$first"
   [ "$skipped" -gt 0 ] && printf '%s\n' "$skipped" >"$RESULTS/skip.$first"
-  [ "$acked" -gt 0 ] && printf '%s\n' "$acked" >"$RESULTS/ack.$first"
   return 0
 }
 
@@ -307,9 +294,8 @@ REPORT="$RESULTS/report"
 cat "$RESULTS"/[0-9]* 2>/dev/null >"$REPORT"
 n=$(grep -c '^FINDING' "$REPORT" 2>/dev/null); n=${n:-0}
 skipped=$(cat "$RESULTS"/skip.* 2>/dev/null | paste -sd+ | bc 2>/dev/null); skipped=${skipped:-0}
-acked=$(cat "$RESULTS"/ack.* 2>/dev/null | paste -sd+ | bc 2>/dev/null); acked=${acked:-0}
 echo "=================== backing-scan report ==================="
-echo "cells: $N  tested: $((N - skipped - acked))  (skipped as invalid: $skipped; acknowledged @if corner: $acked)"
+echo "cells: $N  tested: $((N - skipped))  (skipped as invalid: $skipped)"
 h=$(grep -c $'\tHIGH\t' "$REPORT" 2>/dev/null); h=${h:-0}
 echo "findings: $n  (HIGH: $h)"
 if [ "$n" -gt 0 ]; then
